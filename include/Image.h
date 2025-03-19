@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <functional>
 
 #include "glIncludes.h"
 #include "Color.h"
@@ -14,7 +15,7 @@ namespace ns
     public:
         Image();
         Image(int width, int height);
-        Image(const std::string& file_path);
+        Image(const std::string& file_path, std::function<Color (Color, float, float)> filter = [](Color c, float, float){ return c; });
         Image(const Image& other);
         Image(Image&& other);
         virtual ~Image();

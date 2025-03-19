@@ -52,7 +52,8 @@ void main()
     }
     else
     {
-        FragColor = vec4(texture2D(gSampler, TexCoord0.xy).rgb, Opacity);
+        vec3 BaseColor = texture2D(gSampler, TexCoord0.xy).rgb;
+        FragColor = vec4(BaseColor, Opacity);
     }
     
     //FragColor = vec4(TexCoord0.xy, 0.0, 0.0);

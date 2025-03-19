@@ -19,7 +19,7 @@ namespace ns
         gen_gl_data();
     }
 
-    Image::Image(const std::string& path)
+    Image::Image(const std::string& path, std::function<Color (Color, float, float)> filter)
     {
         int width, height, channels_in_file;
         unsigned char* data = stbi_load(path.c_str(), &width, &height, &channels_in_file, 3);
@@ -38,7 +38,9 @@ namespace ns
             c.r = pixel[0] / 255.0f;
             c.g = pixel[1] / 255.0f;
             c.b = pixel[2] / 255.0f;
-            m_pixels[i] = c;
+            float u = (i % width) / (float)width;
+            float v = (i / width) / (float)height;
+            m_pixels[i] = filter(c, u, v);
         }
 
         stbi_image_free(data);

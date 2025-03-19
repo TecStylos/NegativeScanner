@@ -1,30 +1,48 @@
+#include <set>
 #include <map>
-#include <shared_mutex>
 #include <iostream>
 #include <algorithm>
 #include <filesystem>
+#include <cmath>
 
 #include "glInit.h"
 #include "Window.h"
 #include "ImageRenderer.h"
 #include "Camera.h"
 #include "ThreadPool.h"
+#include "ReadWriteMutex.h"
 
 constexpr ns::Color COLOR_GREY  = { 0.5f, 0.5f, 0.5f };
 constexpr ns::Color COLOR_RED   = { 1.0f, 0.0f, 0.0f };
 constexpr ns::Color COLOR_GREEN = { 0.0f, 1.0f, 0.0f };
 constexpr ns::Color COLOR_BLUE  = { 0.0f, 0.0f, 1.0f };
 
+struct ImageID
+{
+    int x, y;
+};
+
 struct ImageExt
 {
-    int id_x, id_y;
+    ImageID id;
     std::shared_ptr<ns::Image> pImg;
 };
+
+bool operator<(const ImageID& iid1, const ImageID& iid2)
+{
+    if (iid1.x == iid2.x)
+        return iid1.y < iid2.y;
+    return iid1.x < iid2.x;
+}
+bool operator<(const ImageID& iid, const ImageExt& ie) { return iid < ie.id; }
+bool operator<(const ImageExt& ie, const ImageID& iid) { return ie.id < iid; }
+bool operator<(const ImageExt& ie1, const ImageExt& ie2) { return ie1.id < ie2.id; }
 
 struct ImageInfo
 {
     bool has_been_adjusted;
     int pos_x, pos_y;
+    int width, height;
 };
 
 struct Rect
@@ -46,12 +64,14 @@ std::string g_capture_dir;
 
 ns::Camera g_camera;
 
-ImageExt g_image_base;
+ns::ReadWriteMutex g_image_mtx;
+std::set<ImageExt, std::less<>> g_images_base;
 ImageExt g_image_current;
 ImageExt g_image_overlap;
 ImageInfo g_image_overlap_info;
-std::recursive_mutex g_image_overlap_mtx;
 
+int g_image_current_init_x = 0;
+int g_image_current_init_y = 0;
 ns::Color g_image_current_border_color = COLOR_GREY;
 
 int g_curr_id_x;
@@ -93,22 +113,35 @@ std::string get_filename_from_ids(int id_x, int id_y)
     return ss.str();
 }
 
+ImageInfo& get_img_info_from_ext(const ImageExt& img_ext)
+{
+    return g_image_info[img_ext.id.x][img_ext.id.y];
+}
+
 ImageExt load_image(int id_x, int id_y)
 {
     ImageExt img_ext;
-    img_ext.id_x = id_x;
-    img_ext.id_y = id_y;
+    img_ext.id.x = id_x;
+    img_ext.id.y = id_y;
 
     std::string filepath = g_capture_dir + get_filename_from_ids(id_x, id_y);
 
-    img_ext.pImg = std::make_shared<ns::Image>(filepath);
+    auto reverse_vignette = [](ns::Color c, float u, float v)
+    {
+        u = (u - 0.5f) * 2.0f;
+        v = (v - 0.5f) * 2.0f;
+        float m = 1.5f;
+        float s = std::sqrt(u*u + v*v) / m + 1.0f - 1.0f / m;
+        return ns::Color{ c.r * s, c.g * s, c.b * s };
+    };
+
+    img_ext.pImg = std::make_shared<ns::Image>(filepath, reverse_vignette);
+
+    auto& img_info = get_img_info_from_ext(img_ext);
+    img_info.width = img_ext.pImg->get_width();
+    img_info.height = img_ext.pImg->get_height();
 
     return img_ext;
-}
-
-ImageInfo& get_img_info_from_ext(const ImageExt& img_ext)
-{
-    return g_image_info[img_ext.id_x][img_ext.id_y];
 }
 
 void init_image_info()
@@ -151,27 +184,52 @@ void render_image(const ImageExt& img_ext, float opacity, bool has_border, ns::C
     render_image(img_ext, img_info, opacity, has_border, border_color);
 }
 
+Rect get_rect_from_img_info(const ImageInfo& img_info)
+{
+    Rect rect;
+
+    rect.x = img_info.pos_x;
+    rect.y = img_info.pos_y;
+    rect.w = img_info.width;
+    rect.h = img_info.height;
+
+    return rect;
+}
+
+Rect get_overlap_rect(const Rect& rect, const ImageInfo& img_info)
+{
+    Rect new_rect;
+    new_rect.x = std::max(rect.x, img_info.pos_x);
+    new_rect.y = std::max(rect.y, img_info.pos_y);
+    new_rect.w = std::min(rect.x + rect.w - new_rect.x, img_info.pos_x + img_info.width);
+    new_rect.h = std::min(rect.y + rect.h - new_rect.y, img_info.pos_y + img_info.height);
+
+    return new_rect;
+}
+
 Rect get_overlap_rect(int off_x, int off_y)
 {
-    auto& img_info_base = get_img_info_from_ext(g_image_base);
+    //ns::ReadLock lock(g_image_mtx);
+
     auto& img_info_curr = get_img_info_from_ext(g_image_current);
+    Rect rect = get_rect_from_img_info(img_info_curr);
+    rect.x += off_x;
+    rect.y += off_y;
 
-    Rect r;
-    r.x = std::max(img_info_base.pos_x, img_info_curr.pos_x + off_x);
-    r.y = std::max(img_info_base.pos_y, img_info_curr.pos_y + off_y);
-    r.w = std::min(img_info_base.pos_x + g_image_base.pImg->get_width(),
-                   img_info_curr.pos_x + g_image_current.pImg->get_width() + off_x) - r.x;
-    r.h = std::min(img_info_base.pos_y + g_image_base.pImg->get_height(),
-                   img_info_curr.pos_y + g_image_current.pImg->get_height() + off_y) - r.y;
+    for (auto& image_base : g_images_base)
+    {
+        auto& img_info_base = get_img_info_from_ext(image_base);
+        rect = get_overlap_rect(rect, img_info_base);
+    }
 
-    return r;
+    return rect;
 }
 
 bool image_overlap_is_outdated()
 {
-    Rect r = get_overlap_rect(0, 0);
+    //ns::ReadLock lock(g_image_mtx);
 
-    std::lock_guard lock(g_image_overlap_mtx);
+    Rect r = get_overlap_rect(0, 0);
 
     return !g_image_overlap.pImg ||
            r.x != g_image_overlap_info.pos_x          || r.y != g_image_overlap_info.pos_y ||
@@ -180,84 +238,140 @@ bool image_overlap_is_outdated()
 
 float calculate_diff_rect(int off_x, int off_y, bool update_image_overlap)
 {
-    Rect r = get_overlap_rect(off_x, off_y);
+    //ns::ReadLock lock(g_image_mtx);
 
-    if (update_image_overlap)
-    {
-        std::lock_guard lock(g_image_overlap_mtx);
+    Rect rect_combined = get_overlap_rect(off_x, off_y);
 
-        g_image_overlap_info.pos_x = r.x;
-        g_image_overlap_info.pos_y = r.y;
+    //if (update_image_overlap)
+    //{
+    //    g_image_overlap_info.pos_x = rect_combined.x;
+    //    g_image_overlap_info.pos_y = rect_combined.y;
+    //
+    //    g_image_overlap.pImg = std::make_shared<ns::Image>(rect_combined.w, rect_combined.h);
+    //}
 
-        g_image_overlap.pImg = std::make_shared<ns::Image>(r.w, r.h);
-    }
-
-    auto& img_info_base = get_img_info_from_ext(g_image_base);
     auto& img_info_curr = get_img_info_from_ext(g_image_current);
+    Rect rect_img_curr = get_rect_from_img_info(img_info_curr);
+    rect_img_curr.x += off_x;
+    rect_img_curr.y += off_y;
+    
+    float size_combined = 0.0f;
+    float diff_score_combined = 0.0f;
 
-    float diff_score = 0.0f;
-
-    for (int y = 0; y < r.h; ++y)
+    for (auto& image_base : g_images_base)
     {
-        for (int x = 0; x < r.w; ++x)
+        auto& img_info_base = get_img_info_from_ext(image_base);
+
+        Rect rect = get_overlap_rect(rect_img_curr, img_info_base);
+
+        float diff_score = 0.0f;
+
+        for (int y = 0; y < rect.h; ++y)
         {
-            ns::Color c_base = g_image_base.pImg->get_pixel(r.x - img_info_base.pos_x + x,
-                                                            r.y - img_info_base.pos_y + y);
-            ns::Color c_curr = g_image_current.pImg->get_pixel(r.x - img_info_curr.pos_x - off_x + x,
-                                                               r.y - img_info_curr.pos_y - off_y + y);
-
-            float diff = std::abs((c_base.r + c_base.g + c_base.b) - (c_curr.r + c_curr.g + c_curr.b)) / 3.0f;
-            
-            if (update_image_overlap)
+            for (int x = 0; x < rect.w; ++x)
             {
-                std::lock_guard lock(g_image_overlap_mtx);
-                g_image_overlap.pImg->put_pixel({ diff, diff, diff }, x, y);
-            }
+                int base_x = rect.x - img_info_base.pos_x + x;
+                int base_y = rect.y - img_info_base.pos_y + y;
+                ns::Color c_base = image_base.pImg->get_pixel(base_x, base_y);
+                int curr_x = rect.x - img_info_curr.pos_x - off_x + x;
+                int curr_y = rect.y - img_info_curr.pos_y - off_y + y;
+                ns::Color c_curr = g_image_current.pImg->get_pixel(curr_x, curr_y);
 
-            diff_score += diff;
+                float diff = std::abs((c_base.r + c_base.g + c_base.b) - (c_curr.r + c_curr.g + c_curr.b)) / 3.0f;
+                
+                //if (update_image_overlap)
+                //    g_image_overlap.pImg->put_pixel({ diff, diff, diff }, x, y);
+
+                diff_score += diff;
+            }
         }
+
+        size_combined += rect.w * rect.h;
+        diff_score_combined += diff_score;
     }
 
-    diff_score /= r.w * r.h;
+    diff_score_combined /= size_combined;
 
-    return diff_score;
+    return diff_score_combined;
 }
 
 void update_images()
 {
-    if (g_curr_id_x != g_image_current.id_x || g_curr_id_y != g_image_current.id_y)
+    //ns::WriteLock lock(g_image_mtx);
+
+    if (g_curr_id_x != g_image_current.id.x || g_curr_id_y != g_image_current.id.y)
     {
-        int off_x = 0, off_y = 0;
-
-        if (g_curr_id_x == 0) // Moved to new row
+        int new_x, new_y;
         {
-            g_image_base = load_image(g_curr_id_x, g_curr_id_y - 1);
-        }
-        else // Moved by one frame
-        {
-            // Store offset of base & current frame (later applied to new current frame)
-            auto& img_info_base = get_img_info_from_ext(g_image_base);
-            auto& img_info_curr = get_img_info_from_ext(g_image_current);
-            off_x = img_info_curr.pos_x - img_info_base.pos_x;
-            off_y = img_info_curr.pos_y - img_info_base.pos_y;
-
-            g_image_base = load_image(g_curr_id_x - 1, g_curr_id_y);
+            auto& img_curr_info = get_img_info_from_ext(g_image_current);
+            new_x = img_curr_info.pos_x * 2 - g_image_current_init_x;
+            new_y = img_curr_info.pos_y * 2 - g_image_current_init_y;
         }
 
         g_image_current = load_image(g_curr_id_x, g_curr_id_y);
         
-        auto& img_info_curr = get_img_info_from_ext(g_image_current);
-
         // Predict position if image has never been adjusted
-        if (!img_info_curr.has_been_adjusted)
         {
-            // Set new current frame pos to base frame pos
-            img_info_curr = get_img_info_from_ext(g_image_base);
+            auto& img_info_curr = get_img_info_from_ext(g_image_current);
+            if (!img_info_curr.has_been_adjusted)
+            {
+                img_info_curr.pos_x = new_x;
+                img_info_curr.pos_y = new_y;
 
-            // Apply offset
-            img_info_curr.pos_x += off_x;
-            img_info_curr.pos_y += off_y;
+                g_image_current_init_x = new_x;
+                g_image_current_init_y = new_y;
+            }
         }
+
+        // Remove out of bounds bases
+        {
+            auto& img_info_curr = get_img_info_from_ext(g_image_current);
+            Rect rect = get_rect_from_img_info(img_info_curr);
+
+            auto it = g_images_base.begin();
+            while (it != g_images_base.end())
+            {
+                auto curr = it++;
+
+                auto& img_info = get_img_info_from_ext(*curr);
+                Rect overlap_rect = get_overlap_rect(rect, img_info);
+                if (overlap_rect.w <= 0 || overlap_rect.h <= 0)
+                    g_images_base.erase(curr);
+            }
+        }
+
+        // Load in-bounds bases
+        {
+            auto& img_info_curr = get_img_info_from_ext(g_image_current);
+            Rect rect = get_rect_from_img_info(img_info_curr);
+
+            for (int id_x = 0; id_x < (int)g_image_info.size(); ++id_x)
+            {
+                for (int id_y = 0; id_y < (int)g_image_info[0].size(); ++id_y)
+                {
+                    auto& img_info = g_image_info[id_x][id_y];
+
+                    // Skip untouched images
+                    if (!img_info.has_been_adjusted)
+                        continue;
+
+                    // Skip already loaded images
+                    if (g_images_base.find(ImageID{ id_x, id_y }) != g_images_base.end())
+                        continue;
+
+                    // Skip out of bounds images
+                    Rect overlap_rect = get_overlap_rect(rect, img_info);
+                    if (overlap_rect.w <= 0 || overlap_rect.h <= 0)
+                        continue;
+
+                    g_images_base.insert(load_image(id_x, id_y));
+                }
+            }
+        }
+
+        // Load default image base
+        if (g_images_base.empty())
+            g_images_base.insert(load_image(0, 0));
     }
 
     if (g_view_image_overlap)
@@ -271,30 +385,63 @@ void update_images()
     }
 }
 
-void render_func()
+void render_images_base()
 {
-    update_images();
+    //ns::ReadLock lock(g_image_mtx);
 
-    render_image(g_image_base, 1.0f, false, {});
-    render_image(g_image_current, 0.5f, true, g_image_current_border_color);
-    
-    if (g_view_image_overlap)
+    bool is_first = true;
+
+    for (auto& image_base : g_images_base)
     {
-        std::lock_guard lock(g_image_overlap_mtx);
-        render_image(g_image_overlap, g_image_overlap_info, 1.0f, false, {});
+        float opacity = 1.0f;//  / (is_first ? 1.0f : g_images_base.size());
+        render_image(image_base, opacity, false, {});
+
+        is_first = false;
     }
+}
+
+void render_image_current()
+{
+    //ns::ReadLock lock(g_image_mtx);
+
+    render_image(g_image_current, 0.5f, true, g_image_current_border_color);
+}
+
+void render_image_overlap()
+{
+    //ns::ReadLock lock(g_image_mtx);
+
+    if (g_view_image_overlap)
+        render_image(g_image_overlap, g_image_overlap_info, 1.0f, false, {});
+}
+
+void render_borders()
+{
+    //ns::ReadLock lock(g_image_mtx);
 
     if (g_view_borders)
     {
         for (auto& row : g_image_info)
             for (auto& info : row)
                 if (info.has_been_adjusted)
-                    render_image(g_image_base, info, 0.0f, true, COLOR_BLUE);
+                    render_image(g_image_current, info, 0.0f, true, COLOR_BLUE); // Transparent render, image content is irrelevant
     }
+}
+
+void render_func()
+{
+    update_images();
+
+    render_images_base();
+    render_image_current();
+    render_image_overlap();
+    render_borders();
 }
 
 bool move_to_best_diff_score(int test_range)
 {
+    //ns::ReadLock lock(g_image_mtx);
+
     printf("Testing for best diff score in range %d...\n", test_range);
 
     auto diff_scores = std::make_shared<std::vector<std::vector<float>>>(test_range * 2 + 1, std::vector<float>(test_range * 2 + 1, 0.0f));
@@ -400,6 +547,8 @@ void handle_events(ns::Events& events)
             }
             case ns::MouseEvent::State::Up:
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 if (event.get_button() != ns::MouseEvent::Button::Left && event.get_button() != ns::MouseEvent::Button::Right)
                     break;
 
@@ -414,6 +563,8 @@ void handle_events(ns::Events& events)
                 if (event.get_button() == ns::MouseEvent::Button::Left)
                     move_to_local_minimum(1, 64);
             }
+            case ns::MouseEvent::State::None: // Should never occur
+                break;
             }
             break;
         }
@@ -449,6 +600,8 @@ void handle_events(ns::Events& events)
                 break;
             case 'i':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 auto& img_info = get_img_info_from_ext(g_image_current);
                 img_info.pos_y -= 1;
                 img_info.has_been_adjusted = true;
@@ -456,6 +609,8 @@ void handle_events(ns::Events& events)
             }
             case 'k':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 auto& img_info = get_img_info_from_ext(g_image_current);
                 img_info.pos_y += 1;
                 img_info.has_been_adjusted = true;
@@ -463,6 +618,8 @@ void handle_events(ns::Events& events)
             }
             case 'j':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 auto& img_info = get_img_info_from_ext(g_image_current);
                 img_info.pos_x -= 1;
                 img_info.has_been_adjusted = true;
@@ -470,6 +627,8 @@ void handle_events(ns::Events& events)
             }
             case 'l':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 auto& img_info = get_img_info_from_ext(g_image_current);
                 img_info.pos_x += 1;
                 img_info.has_been_adjusted = true;
@@ -477,6 +636,8 @@ void handle_events(ns::Events& events)
             }
             case 'n':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 auto& img_info = get_img_info_from_ext(g_image_current);
                 if (!img_info.has_been_adjusted)
                 {
@@ -502,6 +663,8 @@ void handle_events(ns::Events& events)
             }
             case 'p':
             {
+                //ns::ReadLock lock(g_image_mtx);
+
                 if (--g_curr_id_x < 0)
                 {
                     g_curr_id_x = (int)g_image_info.size() - 1;
