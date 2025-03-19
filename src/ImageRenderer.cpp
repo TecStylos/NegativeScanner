@@ -41,13 +41,14 @@ uniform sampler2D gSampler;
 
 uniform float Opacity;
 uniform float HasBorder;
+uniform vec3  BorderColor;
 
 void main()
 {
     if (HasBorder > 0.5 && 
         (TexCoord0.x < 0.01 || TexCoord0.x > 0.99 || TexCoord0.y < 0.01 || TexCoord0.y > 0.99))
     {
-        FragColor = vec4(1.0, 0.0, 0.0, 0.2);
+        FragColor = vec4(BorderColor, 0.5);
     }
     else
     {
@@ -67,7 +68,7 @@ namespace ns
         load_shader_program();
     }
 
-    void ImageRenderer::render(const Image& img, int x, int y, const Camera& cam, float opacity, bool has_border)
+    void ImageRenderer::render(const Image& img, int x, int y, const Camera& cam, float opacity, bool has_border, Color border_color)
     {
         glUseProgram(m_shader_prog);
 
@@ -85,6 +86,9 @@ namespace ns
 
         GLint u_has_border = glGetUniformLocation(m_shader_prog, "HasBorder");
         glUniform1f(u_has_border, has_border ? 1.0f : 0.0f);
+
+        GLint u_border_color = glGetUniformLocation(m_shader_prog, "BorderColor");
+        glUniform3f(u_border_color, border_color.r, border_color.g, border_color.b);
     
         glEnableVertexAttribArray(0);
         glEnableVertexAttribArray(1);

@@ -10,7 +10,7 @@ namespace ns
     public:
         ImageRenderer();
     public:
-        void render(const Image& img, int x, int y, const Camera& cam, float opacity, bool has_border);
+        void render(const Image& img, int x, int y, const Camera& cam, float opacity, bool has_border, Color border_color);
     private:
         void generate_vertex_buffer();
         void load_shader_program();
