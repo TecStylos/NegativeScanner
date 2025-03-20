@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <queue>
 #include <functional>
 
 #include "glIncludes.h"
@@ -26,6 +27,7 @@ namespace ns
     public:
         int get_width() const;
         int get_height() const;
+        bool is_viewable() const;
     public:
         const Color& get_pixel(int x, int y) const;
     public:
@@ -33,6 +35,8 @@ namespace ns
     public:
         bool save_to_file(const std::string& filepath) const;
         static Image load_from_file(const std::string& filepath, bool make_viewable = true, std::function<Color (Color, float, float)> filter = [](Color c, float, float){ return c; });
+    public:
+        static void delete_pending_tex_objs();
     private:
         int pos_to_index(int x, int y) const;
     private:
@@ -47,5 +51,8 @@ namespace ns
         bool m_make_viewable;
     private:
         GLuint m_textureObject;
+    private:
+        static std::mutex s_tex_objs_to_delete_mtx;
+        static std::queue<GLuint> s_tex_objs_to_delete;
     };
 }

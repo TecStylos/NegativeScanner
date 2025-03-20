@@ -4,6 +4,7 @@
 #include <iostream>
 #include <algorithm>
 #include <filesystem>
+#include <shared_mutex>
 #include <cmath>
 
 #include "glInit.h"
@@ -13,11 +14,15 @@
 #include "ThreadPool.h"
 #include "ReadWriteMutex.h"
 
-constexpr ns::Color COLOR_GREY   = { 0.5f, 0.5f, 0.5f, 1.0f };
-constexpr ns::Color COLOR_RED    = { 1.0f, 0.0f, 0.0f, 1.0f };
-constexpr ns::Color COLOR_GREEN  = { 0.0f, 1.0f, 0.0f, 1.0f };
-constexpr ns::Color COLOR_BLUE   = { 0.0f, 0.0f, 1.0f, 1.0f };
-constexpr ns::Color COLOR_ORANGE = { 1.0f, 0.6f, 0.0f, 1.0f };
+constexpr ns::Color COLOR_GREY      = { 0.5f, 0.5f, 0.5f, 1.0f };
+constexpr ns::Color COLOR_RED       = { 1.0f, 0.0f, 0.0f, 1.0f };
+constexpr ns::Color COLOR_GREEN     = { 0.0f, 1.0f, 0.0f, 1.0f };
+constexpr ns::Color COLOR_BLUE      = { 0.0f, 0.0f, 1.0f, 1.0f };
+constexpr ns::Color COLOR_TURQUOISE = { 0.5f, 0.7f, 0.6f, 1.0f };
+constexpr ns::Color COLOR_ORANGE    = { 1.0f, 0.6f, 0.0f, 1.0f };
+
+constexpr size_t MAX_LOADED_IMAGES = 160;
+constexpr int MAX_ITER_TEST_LOCAL_MINIMUM = 16;
 
 struct ImageID
 {
@@ -29,7 +34,19 @@ bool operator==(const ImageID& iid1, const ImageID& iid2) { return iid1.x == iid
 struct ImageExt
 {
     ImageID id;
+    bool is_filtered;
     ns::Image img;
+};
+
+struct ImageExtLocked
+{
+    const ImageExt* p_img_ext;
+    std::shared_lock<std::shared_mutex> lock;
+public:
+    const ImageExt& operator*() const { return *p_img_ext; }
+    const ImageExt* operator->() { return p_img_ext; }
+public:
+    operator bool() { return p_img_ext; }
 };
 
 bool operator<(const ImageID& iid1, const ImageID& iid2)
@@ -59,6 +76,7 @@ struct DiffScoreThreadData
 {
     int min_x, min_y;
     int off_x, off_y;
+    int step_size;
     std::vector<std::vector<float>>* p_diff_scores;
 };
 
@@ -68,12 +86,16 @@ std::filesystem::path g_capture_dir;
 
 ns::Camera g_camera = { 0.0f, 0.0f, 0.0005f };
 
-ns::ReadWriteMutex g_image_mtx;
-std::set<ImageExt, std::less<>> g_images_base;
-ImageExt g_image_current;
+std::shared_mutex g_images_mtx;
+
+std::set<ImageExt, std::less<>> g_loaded_images;
+
+std::set<ImageID> g_image_base_ids;
+ImageID g_image_current_id;
 ImageExt g_image_overlap;
 ImageInfo g_image_overlap_info;
 
+bool g_hide_image_current = false;
 int g_image_current_init_x = 0;
 int g_image_current_init_y = 0;
 float g_image_current_opacity = 0.5f;
@@ -254,16 +276,62 @@ std::string get_filename_from_ids(int id_x, int id_y)
     return ss.str();
 }
 
-ImageInfo& get_img_info_from_ext(const ImageExt& img_ext)
+ImageInfo& get_img_info_from_id(const ImageID& img_id)
 {
-    return g_image_info[img_ext.id.x][img_ext.id.y];
+    return g_image_info[img_id.x][img_id.y];
 }
 
-ImageExt load_image(int id_x, int id_y, bool make_viewable = true, bool use_filter = true)
+ImageInfo& get_img_info_from_ext(const ImageExt& img_ext)
 {
+    return get_img_info_from_id(img_ext.id);
+}
+
+ImageExtLocked get_img_ext_from_id(const ImageID& img_id)
+{
+    ImageExtLocked iel;
+    iel.p_img_ext = nullptr;
+    iel.lock = std::shared_lock(g_images_mtx);
+
+    auto it = g_loaded_images.find(img_id);
+    if (it != g_loaded_images.end())
+        iel.p_img_ext = &*it;
+    else
+        iel.lock.unlock();
+
+    return iel;
+}
+
+ImageID load_image(int id_x, int id_y, bool make_viewable = true, bool use_filter = true)
+{
+    // Check if image has already been loaded
+    {
+        std::unique_lock lock(g_images_mtx);
+
+        auto it = g_loaded_images.find(ImageID{ id_x, id_y });
+        if (it != g_loaded_images.end())
+        {
+            // If same settings applied, return image id
+            if (it->is_filtered == use_filter &&
+                it->img.is_viewable() == make_viewable)
+            {
+                printf("Loaded in-memory image %d/%d\n", id_x, id_y);
+                return { id_x, id_y };
+            }
+            else // Otherwise remove loaded image and continue loading the correct one
+            {
+                g_loaded_images.erase(it);
+                g_image_base_ids.erase({ id_x, id_y });
+                printf("Removed image %d/%d with wrong settings\n", id_x, id_y);
+            }
+        }
+    }
+
+    printf("Loading image %d/%d from disk...\n", id_x, id_y);
+
     ImageExt img_ext;
     img_ext.id.x = id_x;
     img_ext.id.y = id_y;
+    img_ext.is_filtered = use_filter;
 
     std::string filepath = g_capture_dir / get_filename_from_ids(id_x, id_y);
 
@@ -289,7 +357,47 @@ ImageExt load_image(int id_x, int id_y, bool make_viewable = true, bool use_filt
     img_info.width = img_ext.img.get_width();
     img_info.height = img_ext.img.get_height();
 
-    return img_ext;
+
+    std::unique_lock lock(g_images_mtx);
+
+    if (g_loaded_images.size() >= MAX_LOADED_IMAGES)
+    {
+        printf("Image buffer full, searching best candidate...\n");
+        auto& img_curr_info = get_img_info_from_id(g_image_current_id);
+
+        int furthest_dist = 0;
+        bool furthest_is_in_use = true;
+        ImageID furthest_img_id = { 0, 0 };
+
+        for (auto& img_ext : g_loaded_images)
+        {
+            auto& img_info = get_img_info_from_ext(img_ext);
+
+            int dx = img_curr_info.pos_x - img_info.pos_x;
+            int dy = img_curr_info.pos_y - img_info.pos_y;
+            int dist = dx*dx + dy*dy;
+
+            // Prefer images not in use
+            bool is_in_use = g_image_base_ids.find(img_ext.id) != g_image_base_ids.end();
+
+            if ((!is_in_use && furthest_is_in_use) ||
+                (dist > furthest_dist))
+            {
+                furthest_dist = dist;
+                furthest_is_in_use = is_in_use;
+                furthest_img_id = img_ext.id;
+            }
+        }
+
+        g_loaded_images.erase(g_loaded_images.find(furthest_img_id));
+        g_image_base_ids.erase(furthest_img_id);
+
+        printf("Removed image %d/%d from image buffer (in use?: %d)\n", furthest_img_id.x, furthest_img_id.y, (int)furthest_is_in_use);
+    }
+
+    g_loaded_images.insert(std::move(img_ext));
+
+    return { id_x, id_y };
 }
 
 void render_final_image()
@@ -329,14 +437,22 @@ void render_final_image()
     {
         for (int id_y = 0; id_y < (int)g_image_info[0].size(); ++id_y)
         {
-            printf("\e[0E[%lu/%lu]", id_x * g_image_info.size() + id_y, g_image_info.size() * g_image_info[0].size());
+            printf("\e[0E[%lu/%lu]", id_x * g_image_info[0].size() + id_y, g_image_info.size() * g_image_info[0].size());
+            fflush(stdout);
 
             auto& sub_img_info = g_image_info[id_x][id_y];
 
             if (!sub_img_info.has_been_adjusted)
                 continue;
 
-            auto sub_img = load_image(id_x, id_y, false, false);
+            auto sub_img_id = load_image(id_x, id_y, false, false);
+            auto sub_img = get_img_ext_from_id(sub_img_id);
+
+            if (!sub_img)
+            {
+                printf("Unable to get image %d/%d\n", id_x, id_y);
+                continue;
+            }
 
             for (int x = 0; x < sub_img_info.width; ++x)
             {
@@ -345,7 +461,7 @@ void render_final_image()
                     int img_x = sub_img_info.pos_x + x - min_x;
                     int img_y = sub_img_info.pos_y + y - min_y;
 
-                    auto sub_c = sub_img.img.get_pixel(x, y);
+                    auto sub_c = sub_img->img.get_pixel(x, y);
                     auto img_c = img.get_pixel(img_x, img_y);
 
                     img_c.r += sub_c.r;
@@ -421,6 +537,18 @@ void render_image(const ImageExt& img_ext, float opacity, bool has_border, ns::C
     render_image(img_ext, img_info, opacity, has_border, border_color);
 }
 
+void render_image(const ImageID& img_id, float opacity, bool has_border, ns::Color border_color)
+{
+    auto img_ext = get_img_ext_from_id(img_id);
+    if (!img_ext)
+    {
+        printf("Cannot render image %d/%d\n", img_id.x, img_id.y);
+        return;
+    }
+
+    render_image(*img_ext, opacity, has_border, border_color);
+}
+
 Rect get_rect_from_img_info(const ImageInfo& img_info)
 {
     Rect rect;
@@ -446,16 +574,14 @@ Rect get_overlap_rect(const Rect& rect, const ImageInfo& img_info)
 
 Rect get_overlap_rect(int off_x, int off_y)
 {
-    //ns::ReadLock lock(g_image_mtx);
-
-    auto& img_info_curr = get_img_info_from_ext(g_image_current);
+    auto& img_info_curr = get_img_info_from_id(g_image_current_id);
     Rect rect = get_rect_from_img_info(img_info_curr);
     rect.x += off_x;
     rect.y += off_y;
 
-    for (auto& image_base : g_images_base)
+    for (auto& img_base_id : g_image_base_ids)
     {
-        auto& img_info_base = get_img_info_from_ext(image_base);
+        auto& img_info_base = get_img_info_from_id(img_base_id);
         rect = get_overlap_rect(rect, img_info_base);
     }
 
@@ -464,18 +590,14 @@ Rect get_overlap_rect(int off_x, int off_y)
 
 bool image_overlap_is_outdated()
 {
-    //ns::ReadLock lock(g_image_mtx);
-
     Rect r = get_overlap_rect(0, 0);
 
     return r.x != g_image_overlap_info.pos_x      || r.y != g_image_overlap_info.pos_y ||
            r.w != g_image_overlap.img.get_width() || r.h != g_image_overlap.img.get_height();
 }
 
-float calculate_diff_rect(int off_x, int off_y, bool update_image_overlap)
+float calculate_diff_rect(int off_x, int off_y, int step_size, bool update_image_overlap)
 {
-    //ns::ReadLock lock(g_image_mtx);
-
     (void)update_image_overlap;
     //Rect rect_combined = get_overlap_rect(off_x, off_y);
 
@@ -487,32 +609,46 @@ float calculate_diff_rect(int off_x, int off_y, bool update_image_overlap)
     //    g_image_overlap.img = std::make_shared<ns::Image>(rect_combined.w, rect_combined.h);
     //}
 
-    auto& img_info_curr = get_img_info_from_ext(g_image_current);
-    Rect rect_img_curr = get_rect_from_img_info(img_info_curr);
-    rect_img_curr.x += off_x;
-    rect_img_curr.y += off_y;
+    auto img_curr = get_img_ext_from_id(g_image_current_id);
+    if (!img_curr)
+    {
+        printf("Cannot calculate diff_rect for image %d/%d\n", g_image_current_id.x, g_image_current_id.y);
+        return 0.0f;
+    }
+
+    auto& img_curr_info = get_img_info_from_id(g_image_current_id);
+    Rect img_curr_rect = get_rect_from_img_info(img_curr_info);
+    img_curr_rect.x += off_x;
+    img_curr_rect.y += off_y;
     
     float size_combined = 0.0f;
     float diff_score_combined = 0.0f;
 
-    for (auto& image_base : g_images_base)
+    for (auto& img_base_id : g_image_base_ids)
     {
-        auto& img_info_base = get_img_info_from_ext(image_base);
+        auto img_base = get_img_ext_from_id(img_base_id);
+        if (!img_base)
+        {
+            printf("Cannot calculate partial diff_rect for image %d/%d\n", img_base_id.x, img_base_id.y);
+            continue;
+        }
 
-        Rect rect = get_overlap_rect(rect_img_curr, img_info_base);
+        auto& img_info_base = get_img_info_from_id(img_base_id);
+
+        Rect rect = get_overlap_rect(img_curr_rect, img_info_base);
 
         float diff_score = 0.0f;
 
-        for (int y = 0; y < rect.h; ++y)
+        for (int y = 0; y < rect.h; y += step_size)
         {
-            for (int x = 0; x < rect.w; ++x)
+            for (int x = 0; x < rect.w; x += step_size)
             {
                 int base_x = rect.x - img_info_base.pos_x + x;
                 int base_y = rect.y - img_info_base.pos_y + y;
-                ns::Color c_base = image_base.img.get_pixel(base_x, base_y);
-                int curr_x = rect.x - img_info_curr.pos_x - off_x + x;
-                int curr_y = rect.y - img_info_curr.pos_y - off_y + y;
-                ns::Color c_curr = g_image_current.img.get_pixel(curr_x, curr_y);
+                ns::Color c_base = img_base->img.get_pixel(base_x, base_y);
+                int curr_x = rect.x - img_curr_info.pos_x - off_x + x;
+                int curr_y = rect.y - img_curr_info.pos_y - off_y + y;
+                ns::Color c_curr = img_curr->img.get_pixel(curr_x, curr_y);
 
                 //float diff = std::abs((c_base.r + c_base.g + c_base.b) - (c_curr.r + c_curr.g + c_curr.b)) / 3.0f;
                 float diff = std::abs(c_base.a - c_curr.a);
@@ -524,7 +660,7 @@ float calculate_diff_rect(int off_x, int off_y, bool update_image_overlap)
             }
         }
 
-        size_combined += rect.w * rect.h;
+        size_combined += rect.w * rect.h / step_size / step_size;
         diff_score_combined += diff_score;
     }
 
@@ -535,22 +671,22 @@ float calculate_diff_rect(int off_x, int off_y, bool update_image_overlap)
 
 void update_images()
 {
-    //ns::WriteLock lock(g_image_mtx);
+    ns::Image::delete_pending_tex_objs();
 
-    if (g_curr_id.x != g_image_current.id.x || g_curr_id.y != g_image_current.id.y)
+    if (g_curr_id.x != g_image_current_id.x || g_curr_id.y != g_image_current_id.y)
     {
         int new_x, new_y;
         {
-            auto& img_curr_info = get_img_info_from_ext(g_image_current);
+            auto& img_curr_info = get_img_info_from_id(g_image_current_id);
             new_x = img_curr_info.pos_x;
             new_y = img_curr_info.pos_y;
         }
 
-        g_image_current = load_image(g_curr_id.x, g_curr_id.y);
+        g_image_current_id = load_image(g_curr_id.x, g_curr_id.y);
 
         // Predict position if image has never been adjusted
         {
-            auto& img_info_curr = get_img_info_from_ext(g_image_current);
+            auto& img_info_curr = get_img_info_from_id(g_image_current_id);
             if (!img_info_curr.has_been_adjusted)
             {
                 img_info_curr.pos_x = new_x;
@@ -566,7 +702,7 @@ void update_images()
 
     static int prev_x = -1;
     static int prev_y = -1;
-    auto& img_info_curr = get_img_info_from_ext(g_image_current);
+    auto& img_info_curr = get_img_info_from_id(g_image_current_id);
     Rect rect_curr = get_rect_from_img_info(img_info_curr);
 
     if (prev_x != img_info_curr.pos_x || prev_y != img_info_curr.pos_y)
@@ -575,21 +711,21 @@ void update_images()
         prev_y = img_info_curr.pos_y;
 
         // Remove out of bounds bases
-        auto it = g_images_base.begin();
-        while (it != g_images_base.end())
+        auto it = g_image_base_ids.begin();
+        while (it != g_image_base_ids.end())
         {
             auto curr = it++;
 
-            if (curr->id == g_image_current.id)
+            if (*curr == g_image_current_id)
             {
-                g_images_base.erase(curr);
+                g_image_base_ids.erase(curr);
                 continue;
             }
 
-            auto& img_info = get_img_info_from_ext(*curr);
+            auto& img_info = get_img_info_from_id(*curr);
             Rect overlap_rect = get_overlap_rect(rect_curr, img_info);
             if (overlap_rect.w <= 0 || overlap_rect.h <= 0)
-                g_images_base.erase(curr);
+                g_image_base_ids.erase(curr);
         }
 
         // Load in-bounds bases
@@ -600,15 +736,15 @@ void update_images()
                 auto& img_info = g_image_info[id_x][id_y];
 
                 // Skip current image
-                if (g_image_current.id == ImageID{ id_x, id_y })
+                if (g_image_current_id == ImageID{ id_x, id_y })
                     continue;
 
                 // Skip untouched images
                 if (!img_info.has_been_adjusted)
                     continue;
 
-                // Skip already loaded images
-                if (g_images_base.find(ImageID{ id_x, id_y }) != g_images_base.end())
+                // Skip images already in use
+                if (g_image_base_ids.find(ImageID{ id_x, id_y }) != g_image_base_ids.end())
                     continue;
 
                 // Skip out of bounds images
@@ -616,20 +752,20 @@ void update_images()
                 if (overlap_rect.w <= 0 || overlap_rect.h <= 0)
                     continue;
 
-                g_images_base.insert(load_image(id_x, id_y));
+                g_image_base_ids.insert(load_image(id_x, id_y));
             }
         }
 
         // Load default image base
-        if (g_images_base.empty())
-            g_images_base.insert(load_image(0, 0));
+        if (g_image_base_ids.empty())
+            g_image_base_ids.insert(load_image(0, 0));
     }
 
     if (g_view_image_overlap)
     {
         if (image_overlap_is_outdated())
         {
-            float diff_score = calculate_diff_rect(0, 0, true);
+            float diff_score = calculate_diff_rect(0, 0, true, 1);
 
             printf("Diff score: %f\n", diff_score);
         }
@@ -638,52 +774,68 @@ void update_images()
 
 void render_images_base()
 {
-    //ns::ReadLock lock(g_image_mtx);
-
-    for (auto& image_base : g_images_base)
+    for (auto& img_base_id : g_image_base_ids)
     {
-        float opacity = 1.0f / ((!g_make_images_base_transparent) ? 1.0f : g_images_base.size());
-        render_image(image_base, opacity, false, {});
+        float opacity = 1.0f / ((!g_make_images_base_transparent) ? 1.0f : g_image_base_ids.size());
+        render_image(img_base_id, opacity, false, {});
     }
 }
 
 void render_image_current()
 {
-    //ns::ReadLock lock(g_image_mtx);
-
-    if (!g_select_image_with_mouse)
-        render_image(g_image_current, g_image_current_opacity, true, g_image_current_border_color);
+    if (!g_select_image_with_mouse && !g_hide_image_current)
+        render_image(g_image_current_id, g_image_current_opacity, true, g_image_current_border_color);
 }
 
 void render_image_overlap()
 {
-    //ns::ReadLock lock(g_image_mtx);
-
     if (g_view_image_overlap && !g_select_image_with_mouse)
         render_image(g_image_overlap, g_image_overlap_info, 1.0f, false, {});
 }
 
 void render_borders()
 {
-    //ns::ReadLock lock(g_image_mtx);
-
     if (g_view_borders)
     {
-        for (auto& row : g_image_info)
-            for (auto& info : row)
+        for (int id_x = 0; id_x < (int)g_image_info.size(); ++id_x)
+        {
+            for (int id_y = 0; id_y < (int)g_image_info[0].size(); ++id_y)
+            {
+                auto& info = get_img_info_from_id({ id_x, id_y });
                 if (info.has_been_adjusted)
-                    render_image(g_image_current, info, 0.0f, true, COLOR_BLUE); // Transparent render, image content is irrelevant
+                {
+                    std::shared_lock lock(g_images_mtx);
+
+                    bool is_loaded = g_loaded_images.find(ImageID{ id_x, id_y }) != g_loaded_images.end();
+
+                    auto img_ext = get_img_ext_from_id(g_image_current_id);
+                    if (!img_ext)
+                    {
+                        printf("Cannot render image %d/%d\n", g_image_current_id.x, g_image_current_id.y);
+                        continue;
+                    }
+
+                    render_image(*img_ext, info, 0.0f, true, is_loaded ? COLOR_TURQUOISE : COLOR_BLUE); // Transparent render, image content is irrelevant
+                }
+            }
+        }
     }
 }
 
 void render_image_mouse_select()
 {
-    //ns::ReadLock lock(g_image_mtx)
-
     if (g_select_image_with_mouse)
     {
         bool is_not_selectable = g_img_id_closest_to_mouse == ImageID{ 0, 0 };
-        render_image(g_image_current, g_image_info[g_img_id_closest_to_mouse.x][g_img_id_closest_to_mouse.y], 0.0f, true, is_not_selectable ? COLOR_RED : COLOR_ORANGE);
+
+        auto img_ext = get_img_ext_from_id(g_image_current_id);
+        if (!img_ext)
+        {
+            printf("Cannot render image %d/%d\n", g_image_current_id.x, g_image_current_id.y);
+            return;
+        }
+
+        render_image(*img_ext, g_image_info[g_img_id_closest_to_mouse.x][g_img_id_closest_to_mouse.y], 0.0f, true, is_not_selectable ? COLOR_RED : COLOR_ORANGE);
     }
 }
 
@@ -698,10 +850,8 @@ void render_func()
     render_image_mouse_select();
 }
 
-bool move_to_best_diff_score(int test_range)
+bool move_to_best_diff_score(int test_range, int step_size)
 {
-    //ns::ReadLock lock(g_image_mtx);
-
     printf("Testing for best diff score in range %d...\n", test_range);
 
     static std::vector<std::vector<float>> diff_scores(test_range * 2 + 1, std::vector<float>(test_range * 2 + 1, 0.0f));
@@ -709,13 +859,14 @@ bool move_to_best_diff_score(int test_range)
     DiffScoreThreadData diff_score_data;
     diff_score_data.min_x = -test_range;
     diff_score_data.min_y = -test_range;
+    diff_score_data.step_size = step_size;
     diff_score_data.p_diff_scores = &diff_scores;
 
     auto diff_score_func = [](const DiffScoreThreadData& data)
     {
         int id_x = data.off_x - data.min_x;
         int id_y = data.off_y - data.min_y;
-        (*data.p_diff_scores)[id_x][id_y] = calculate_diff_rect(data.off_x, data.off_y, false);
+        (*data.p_diff_scores)[id_x][id_y] = calculate_diff_rect(data.off_x, data.off_y, data.step_size, false);
     };
 
     for (int off_x = -test_range; off_x <= test_range; ++off_x)
@@ -752,21 +903,21 @@ bool move_to_best_diff_score(int test_range)
         }
     }
 
-    get_img_info_from_ext(g_image_current).pos_x += best_off_x;
-    get_img_info_from_ext(g_image_current).pos_y += best_off_y;
+    get_img_info_from_id(g_image_current_id).pos_x += best_off_x;
+    get_img_info_from_id(g_image_current_id).pos_y += best_off_y;
     
     printf("  -> Diff score: %f -- off_x:%d off_y:%d\n", best_diff_score, best_off_x, best_off_y);
 
     return best_off_x || best_off_y;
 }
 
-bool move_to_local_minimum(int test_range, int max_iter)
+bool move_to_local_minimum(int test_range, int max_iter, int step_size)
 {
     g_image_current_border_color = COLOR_GREY;
 
     // Loops 'indefinitely', when max_iter <= 0
     while (--max_iter != 0)
-        if (!move_to_best_diff_score(test_range))
+        if (!move_to_best_diff_score(test_range, step_size))
             break;
 
     bool reached_local_minimum = max_iter != 0;
@@ -840,7 +991,7 @@ void handle_events(ns::Events& events)
 
                 if (event.get_button() == ns::MouseButtonEvent::Button::Middle)
                 {
-                    g_img_id_closest_to_mouse = g_image_current.id;
+                    g_img_id_closest_to_mouse = g_image_current_id;
                     g_select_image_with_mouse = true;
                 }
 
@@ -850,8 +1001,6 @@ void handle_events(ns::Events& events)
             }
             case ns::MouseButtonEvent::State::Up:
             {
-                //ns::ReadLock lock(g_image_mtx);
-
                 switch (event.get_button())
                 {
                 case ns::MouseButtonEvent::Button::Left:
@@ -863,13 +1012,16 @@ void handle_events(ns::Events& events)
                     float off_x = event.get_pos_x() - down_x;
                     float off_y = event.get_pos_y() - down_y;
     
-                    auto& img_info_curr = get_img_info_from_ext(g_image_current);
+                    auto& img_info_curr = get_img_info_from_id(g_image_current_id);
                     img_info_curr.pos_x += off_x / g_camera.zoom * 2.0f;
                     img_info_curr.pos_y += off_y / g_camera.zoom * 2.0f;
                     img_info_curr.has_been_adjusted = true;
     
                     if (event.get_button() == ns::MouseButtonEvent::Button::Left)
-                        move_to_local_minimum(g_test_range, 16);
+                    {
+                        if (move_to_local_minimum(g_test_range, MAX_ITER_TEST_LOCAL_MINIMUM, 2))
+                            move_to_local_minimum(g_test_range, MAX_ITER_TEST_LOCAL_MINIMUM, 1);
+                    }
 
                     break;
                 }
@@ -898,184 +1050,198 @@ void handle_events(ns::Events& events)
         case ns::EventType::Keyboard:
         {
             auto& event = pEvent->as_type<ns::KeyboardEvent>();
-
-            if (event.get_state() != ns::KeyboardEvent::State::Down)
-                break;
-
+            
             float cam_move_speed = 0.05f;
             float cam_zoom_speed = 1.05f;
 
-            switch (event.get_key())
+            switch (event.get_state())
             {
-            case 'w':
-                g_camera.y += cam_move_speed / g_camera.zoom;
-                break;
-            case 's':
-                g_camera.y -= cam_move_speed / g_camera.zoom;
-                break;
-            case 'a':
-                g_camera.x += cam_move_speed / g_camera.zoom;
-                break;
-            case 'd':
-                g_camera.x -= cam_move_speed / g_camera.zoom;
-                break;
-            case 'e':
-                g_camera.zoom *= cam_zoom_speed;
-                break;
-            case 'q':
-                g_camera.zoom /= cam_zoom_speed;
-                break;
-            case 'i':
+            case ns::KeyboardEvent::State::Down:
             {
-                //ns::ReadLock lock(g_image_mtx);
-
-                auto& img_info = get_img_info_from_ext(g_image_current);
-                img_info.pos_y -= 1;
-                img_info.has_been_adjusted = true;
-                break;
-            }
-            case 'k':
-            {
-                //ns::ReadLock lock(g_image_mtx);
-
-                auto& img_info = get_img_info_from_ext(g_image_current);
-                img_info.pos_y += 1;
-                img_info.has_been_adjusted = true;
-                g_image_current_border_color = COLOR_GREY;
-                break;
-            }
-            case 'j':
-            {
-                //ns::ReadLock lock(g_image_mtx);
-
-                auto& img_info = get_img_info_from_ext(g_image_current);
-                img_info.pos_x -= 1;
-                img_info.has_been_adjusted = true;
-                g_image_current_border_color = COLOR_GREY;
-                break;
-            }
-            case 'l':
-            {
-                //ns::ReadLock lock(g_image_mtx);
-
-                auto& img_info = get_img_info_from_ext(g_image_current);
-                img_info.pos_x += 1;
-                img_info.has_been_adjusted = true;
-                g_image_current_border_color = COLOR_GREY;
-                break;
-            }
-            case 'n':
-            {
-                //ns::ReadLock lock(g_image_mtx);
-
-                auto& img_info = get_img_info_from_ext(g_image_current);
-                if (!img_info.has_been_adjusted)
+                    switch (event.get_key())
                 {
-                    printf("Adjust image before jumping to the next\n");
+                case 'w':
+                    g_camera.y += cam_move_speed / g_camera.zoom;
+                    break;
+                case 's':
+                    g_camera.y -= cam_move_speed / g_camera.zoom;
+                    break;
+                case 'a':
+                    g_camera.x += cam_move_speed / g_camera.zoom;
+                    break;
+                case 'd':
+                    g_camera.x -= cam_move_speed / g_camera.zoom;
+                    break;
+                case 'e':
+                    g_camera.zoom *= cam_zoom_speed;
+                    break;
+                case 'q':
+                    g_camera.zoom /= cam_zoom_speed;
+                    break;
+                case 'i':
+                {
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    img_info.pos_y -= 1;
+                    img_info.has_been_adjusted = true;
                     break;
                 }
-
-                if (++g_curr_id.x >= (int)g_image_info.size())
+                case 'k':
                 {
-                    g_curr_id.x = 0;
-
-                    if (++g_curr_id.y >= (int)g_image_info[0].size())
-                    {
-                        // Last image reached, generate result and store on disk.
-                        g_curr_id = { 1, 0 };
-                    }
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    img_info.pos_y += 1;
+                    img_info.has_been_adjusted = true;
+                    g_image_current_border_color = COLOR_GREY;
+                    break;
                 }
-
-                break;
-            }
-            case 'p':
-            {
-                //ns::ReadLock lock(g_image_mtx);
-
-                if (--g_curr_id.x < 0)
+                case 'j':
                 {
-                    g_curr_id.x = (int)g_image_info.size() - 1;
-
-                    if (--g_curr_id.y < 0)
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    img_info.pos_x -= 1;
+                    img_info.has_been_adjusted = true;
+                    g_image_current_border_color = COLOR_GREY;
+                    break;
+                }
+                case 'l':
+                {
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    img_info.pos_x += 1;
+                    img_info.has_been_adjusted = true;
+                    g_image_current_border_color = COLOR_GREY;
+                    break;
+                }
+                case 'n':
+                {
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    if (!img_info.has_been_adjusted)
                     {
+                        printf("Adjust image before jumping to the next\n");
+                        break;
+                    }
+
+                    if (++g_curr_id.x >= (int)g_image_info.size())
+                    {
+                        g_curr_id.x = 0;
+
+                        if (++g_curr_id.y >= (int)g_image_info[0].size())
+                        {
+                            // Last image reached, generate result and store on disk.
+                            g_curr_id = { 1, 0 };
+                        }
+                    }
+
+                    break;
+                }
+                case 'p':
+                {
+                    if (--g_curr_id.x < 0)
+                    {
+                        g_curr_id.x = (int)g_image_info.size() - 1;
+
+                        if (--g_curr_id.y < 0)
+                        {
+                            g_curr_id.y = (int)g_image_info[0].size() - 1;
+                        }
+                    }
+
+                    if (g_curr_id.x == 0 && g_curr_id.y == 0)
+                    {
+                        g_curr_id.x = (int)g_image_info.size() - 1;
                         g_curr_id.y = (int)g_image_info[0].size() - 1;
                     }
-                }
-
-                if (g_curr_id.x == 0 && g_curr_id.y == 0)
-                {
-                    g_curr_id.x = (int)g_image_info.size() - 1;
-                    g_curr_id.y = (int)g_image_info[0].size() - 1;
-                }
-                break;
-            }
-            case 'o':
-            {
-                g_view_image_overlap = !g_view_image_overlap;
-                break;
-            }
-            case 'b':
-            {
-                g_view_borders = !g_view_borders;
-                break;
-            }
-            case 't':
-            {
-                g_make_images_base_transparent = !g_make_images_base_transparent;
-                break;
-            }
-            case 'y':
-            {
-                move_to_local_minimum(g_test_range, 16);
-                break;
-            }
-            case 'f':
-            {
-                save_project_to_file();
-                break;
-            }
-            case 'r':
-            {
-                render_final_image();
-                break;
-            }
-            case '1':
-            case '2':
-            case '3':
-            case '4':
-            case '5':
-            case '6':
-            case '7':
-            case '8':
-            case '9':
-            {
-                g_test_range = event.get_key() - '0';
-                printf("Set test_range to %d\n", g_test_range);
-                break;
-            }
-            case ',':
-            {
-                if (g_image_current_opacity < 0.1f)
-                {
-                    printf("Already at minimum opacity\n");
                     break;
                 }
-                g_image_current_opacity -= 0.1f;
-                printf("Decreased opacity to %f\n", g_image_current_opacity);
-                break;
-            }
-            case '.':
-            {
-                if (g_image_current_opacity > 0.9f)
+                case 'o':
                 {
-                    printf("Already at maximum opacity\n");
+                    g_view_image_overlap = !g_view_image_overlap;
                     break;
                 }
-                g_image_current_opacity += 0.1f;
-                printf("Increased opacity to %f\n", g_image_current_opacity);
+                case 'b':
+                {
+                    g_view_borders = !g_view_borders;
+                    break;
+                }
+                case 't':
+                {
+                    g_make_images_base_transparent = !g_make_images_base_transparent;
+                    break;
+                }
+                case 'y':
+                {
+                    move_to_local_minimum(g_test_range, MAX_ITER_TEST_LOCAL_MINIMUM, 1);
+                    break;
+                }
+                case 'f':
+                {
+                    save_project_to_file();
+                    break;
+                }
+                case 'r':
+                {
+                    render_final_image();
+                    break;
+                }
+                case '1':
+                case '2':
+                case '3':
+                case '4':
+                case '5':
+                case '6':
+                case '7':
+                case '8':
+                case '9':
+                {
+                    g_test_range = event.get_key() - '0';
+                    printf("Set test_range to %d\n", g_test_range);
+                    break;
+                }
+                case ',':
+                {
+                    if (g_image_current_opacity < 0.1f)
+                    {
+                        printf("Already at minimum opacity\n");
+                        break;
+                    }
+                    g_image_current_opacity -= 0.1f;
+                    printf("Decreased opacity to %f\n", g_image_current_opacity);
+                    break;
+                }
+                case '.':
+                {
+                    if (g_image_current_opacity > 0.9f)
+                    {
+                        printf("Already at maximum opacity\n");
+                        break;
+                    }
+                    g_image_current_opacity += 0.1f;
+                    printf("Increased opacity to %f\n", g_image_current_opacity);
+                    break;
+                }
+                case ' ':
+                {
+                    g_hide_image_current = true;
+                    break;
+                }
+                }
+                break;
+            }
+            case ns::KeyboardEvent::State::Up:
+            {
+                switch (event.get_key())
+                {
+                case ' ':
+                {
+                    g_hide_image_current = false;
+                    break;
+                }
+                }
+                break;
+            }
+            case ns::KeyboardEvent::State::None: // Should never occur
+            {
                 break;
             }
             }
+            
             break;
         }
         default:

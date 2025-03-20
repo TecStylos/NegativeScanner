@@ -8,6 +8,9 @@
 
 namespace ns
 {
+    std::mutex Image::s_tex_objs_to_delete_mtx;
+    std::queue<GLuint> Image::s_tex_objs_to_delete;
+
     Image::Image()
         : Image(1, 1, false)
     {}
@@ -106,6 +109,11 @@ namespace ns
         return m_height;
     }
 
+    bool Image::is_viewable() const
+    {
+        return m_make_viewable;
+    }
+
     const Color& Image::get_pixel(int x, int y) const
     {
         return m_pixels[pos_to_index(x, y)];
@@ -113,9 +121,6 @@ namespace ns
 
     void Image::bind() const
     {
-        if (!m_make_viewable)
-            return;
-        
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, m_textureObject);
     }
@@ -169,6 +174,18 @@ namespace ns
         return success;
     }
 
+    void Image::delete_pending_tex_objs()
+    {
+        std::lock_guard lock(s_tex_objs_to_delete_mtx);
+
+        while (!s_tex_objs_to_delete.empty())
+        {
+            GLuint tex_obj = s_tex_objs_to_delete.front();
+            s_tex_objs_to_delete.pop();
+            glDeleteTextures(1, &tex_obj);
+        }
+    }
+
     int Image::pos_to_index(int x, int y) const
     {
         return x + y * m_width;
@@ -189,7 +206,8 @@ namespace ns
 
     void Image::clear_gl_data()
     {
-        if (m_textureObject)
-            glDeleteTextures(1, &m_textureObject);
+        if (!m_textureObject)
+            return;
+        m_textureObject = 0;
     }
 }
