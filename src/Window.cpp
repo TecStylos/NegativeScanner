@@ -47,8 +47,12 @@ namespace ns
 
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
 
-        auto mouse_callback = [](int button, int state, int x, int y){ if (!g_window) return; g_window->cb_mouse_event(button, state, x, y); };
-        glutMouseFunc(mouse_callback);
+        auto mouse_move_callback = [](int x, int y){ if (!g_window) return; g_window->cb_mouse_move_event(x, y); };
+        glutMotionFunc(mouse_move_callback);
+        glutPassiveMotionFunc(mouse_move_callback);
+
+        auto mouse_button_callback = [](int button, int state, int x, int y){ if (!g_window) return; g_window->cb_mouse_button_event(button, state, x, y); };
+        glutMouseFunc(mouse_button_callback);
 
         auto keyboard_down_callback = [](unsigned char key, int x, int y){ if (!g_window) return; g_window->cb_keyboard_down_event(key, x, y); };
         glutKeyboardFunc(keyboard_down_callback);
@@ -89,25 +93,30 @@ namespace ns
         glutSwapBuffers();
     }
 
-    void Window::cb_mouse_event(int button, int state, int x, int y)
+    void Window::cb_mouse_move_event(int x, int y)
     {
-        MouseEvent::Button btn = MouseEvent::Button::None;
+        m_events.push(new MouseMoveEvent((float)x / m_width, (float)y / m_height));
+    }
+
+    void Window::cb_mouse_button_event(int button, int state, int x, int y)
+    {
+        MouseButtonEvent::Button btn = MouseButtonEvent::Button::None;
         switch (button)
         {
-            case GLUT_LEFT_BUTTON:   btn = MouseEvent::Button::Left;   break;
-            case GLUT_MIDDLE_BUTTON: btn = MouseEvent::Button::Middle; break;
-            case GLUT_RIGHT_BUTTON:  btn = MouseEvent::Button::Right;  break;
+            case GLUT_LEFT_BUTTON:   btn = MouseButtonEvent::Button::Left;   break;
+            case GLUT_MIDDLE_BUTTON: btn = MouseButtonEvent::Button::Middle; break;
+            case GLUT_RIGHT_BUTTON:  btn = MouseButtonEvent::Button::Right;  break;
             default: printf("Unhandled mouse button %d\n", button);
         }
-        MouseEvent::State st = MouseEvent::State::None;
+        MouseButtonEvent::State st = MouseButtonEvent::State::None;
         switch (state)
         {
-            case GLUT_UP:   st = MouseEvent::State::Up;   break;
-            case GLUT_DOWN: st = MouseEvent::State::Down; break;
+            case GLUT_UP:   st = MouseButtonEvent::State::Up;   break;
+            case GLUT_DOWN: st = MouseButtonEvent::State::Down; break;
             default: assert(false && "Unhandled button state");
         }
 
-        m_events.push(new MouseEvent((float)x / m_width, (float)y / m_height, btn, st));
+        m_events.push(new MouseButtonEvent((float)x / m_width, (float)y / m_height, btn, st));
     }
 
     void Window::cb_keyboard_down_event(unsigned char key, int x, int y)

@@ -26,6 +26,7 @@ namespace ns
         ~ThreadPool();
     public:
         bool is_idle() const;
+        void wait_idle() const;
         void push_job(const Job& job);
         void push_priority_job(const Job& job);
     private:
@@ -36,7 +37,7 @@ namespace ns
         std::deque<Job> m_jobs;
         std::vector<std::thread> m_threads;
         mutable std::mutex m_jobs_mtx;
-        std::condition_variable m_jobs_con_var;
+        mutable std::condition_variable m_jobs_con_var;
         std::atomic_uint64_t m_n_jobs_running;
     };
 
@@ -67,6 +68,7 @@ namespace ns
 
         return m_jobs.empty() && m_n_jobs_running == 0;
     }
+
 
     template <typename T>
     void ThreadPool<T>::push_job(const Job& job)
@@ -128,7 +130,10 @@ namespace ns
                 printf("[ THREAD ERR ]:\n%s\n", e.what());
             }
 
-            --m_n_jobs_running;
+            {
+                std::unique_lock lock(m_jobs_mtx);
+                --m_n_jobs_running;
+            }
         }
     }
 }

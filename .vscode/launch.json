@@ -9,7 +9,7 @@
             "request": "launch",
             "name": "Debug",
             "program": "${workspaceFolder}/bin/Debug/NegativeScanner",
-            "args": [ "/home/tecstylos/Downloads/scan-test-crop/" ],
+            "args": [ "/home/tecstylos/Downloads/scan-test-crop.nsp" ],
             "cwd": "${workspaceFolder}",
             "preLaunchTask": "build",
         }

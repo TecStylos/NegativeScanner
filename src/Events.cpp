@@ -4,32 +4,51 @@
 
 namespace ns
 {
-    MouseEvent::MouseEvent(float x, float y, Button btn, State st)
-        : m_pos_x(x), m_pos_y(y),
-          m_button(btn), m_state(st)
+    MouseMoveEvent::MouseMoveEvent(float x, float y)
+        : m_pos_x(x), m_pos_y(y)
     {}
 
-    EventType MouseEvent::get_type() const
+    EventType MouseMoveEvent::get_type() const
     {
-        return EventType::Mouse;
+        return EventType::MouseMove;
     }
 
-    float MouseEvent::get_pos_x() const
+    float MouseMoveEvent::get_pos_x() const
     {
         return m_pos_x;
     }
 
-    float MouseEvent::get_pos_y() const
+    float MouseMoveEvent::get_pos_y() const
     {
         return m_pos_y;
     }
 
-    MouseEvent::Button MouseEvent::get_button() const
+    MouseButtonEvent::MouseButtonEvent(float x, float y, Button btn, State st)
+        : m_pos_x(x), m_pos_y(y),
+          m_button(btn), m_state(st)
+    {}
+
+    EventType MouseButtonEvent::get_type() const
+    {
+        return EventType::MouseButton;
+    }
+
+    float MouseButtonEvent::get_pos_x() const
+    {
+        return m_pos_x;
+    }
+
+    float MouseButtonEvent::get_pos_y() const
+    {
+        return m_pos_y;
+    }
+
+    MouseButtonEvent::Button MouseButtonEvent::get_button() const
     {
         return m_button;
     }
 
-    MouseEvent::State MouseEvent::get_state() const
+    MouseButtonEvent::State MouseButtonEvent::get_state() const
     {
         return m_state;
     }

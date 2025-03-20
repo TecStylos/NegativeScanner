@@ -11,7 +11,8 @@ namespace ns
 {
     enum class EventType
     {
-        Mouse,
+        MouseMove,
+        MouseButton,
         Keyboard
     };
 
@@ -26,7 +27,21 @@ namespace ns
         virtual EventType get_type() const = 0;
     };
 
-    class MouseEvent : public Event
+    class MouseMoveEvent : public Event
+    {
+    public:
+        MouseMoveEvent(float x, float y);
+    public:
+        virtual EventType get_type() const override;
+    public:
+        float get_pos_x() const;
+        float get_pos_y() const;
+    private:
+        float m_pos_x;
+        float m_pos_y;
+    };
+
+    class MouseButtonEvent : public Event
     {
     public:
         enum class Button
@@ -34,7 +49,7 @@ namespace ns
         enum class State
         { None, Down, Up };
     public:
-        MouseEvent(float x, float y, Button btn, State st);
+        MouseButtonEvent(float x, float y, Button btn, State st);
     public:
         virtual EventType get_type() const override;
     public:

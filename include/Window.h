@@ -21,7 +21,8 @@ namespace ns
         void set_render_func(std::function<void ()> render_func);
     private:
         void cb_render_scene();
-        void cb_mouse_event(int button, int state, int x, int y);
+        void cb_mouse_move_event(int x, int y);
+        void cb_mouse_button_event(int button, int state, int x, int y);
         void cb_keyboard_down_event(unsigned char key, int x, int y);
         void cb_keyboard_up_event(unsigned char key, int x, int y);
         void cb_reshape(int width, int height);
