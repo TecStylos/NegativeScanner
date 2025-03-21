@@ -65,6 +65,7 @@ struct ImageInfo
     int pos_x, pos_y;
     int width, height;
     bool has_been_adjusted;
+    bool ignore;
 };
 
 struct Rect
@@ -481,7 +482,7 @@ void render_final_image()
         for (auto& img_info : row)
         {
             // Skip unplaced images
-            if (!img_info.has_been_adjusted)
+            if (!img_info.has_been_adjusted || img_info.ignore)
                 continue;
 
             if (img_info.pos_x < min_x)
@@ -513,7 +514,7 @@ void render_final_image()
 
             auto& sub_img_info = g_image_info[id_x][id_y];
 
-            if (!sub_img_info.has_been_adjusted)
+            if (!sub_img_info.has_been_adjusted || sub_img_info.ignore)
                 continue;
 
             auto sub_img_id = load_image(id_x, id_y, false, false);
@@ -775,6 +776,10 @@ void update_images()
                 if (!img_info.has_been_adjusted)
                     continue;
 
+                // Skip ignored images
+                if (img_info.ignore)
+                    continue;
+
                 // Skip images already in use
                 if (g_image_base_ids.find(ImageID{ id_x, id_y }) != g_image_base_ids.end())
                     continue;
@@ -842,14 +847,20 @@ void render_borders()
             for (int id_y = 0; id_y < (int)g_image_info[0].size(); ++id_y)
             {
                 auto& info = get_img_info_from_id({ id_x, id_y });
+
                 if (info.has_been_adjusted)
                 {
                     std::shared_lock lock(g_images_mtx);
 
                     ns::Color color = COLOR_BLUE;
 
+                    // is ignored
+                    if (info.ignore)
+                    {
+                        color = COLOR_RED;
+                    }
                     // is loaded
-                    if (g_loaded_images.find(ImageID{ id_x, id_y }) != g_loaded_images.end())
+                    else if (g_loaded_images.find(ImageID{ id_x, id_y }) != g_loaded_images.end())
                     {
                         // is in use
                         if (g_image_base_ids.find(ImageID{ id_x, id_y }) != g_image_base_ids.end())
@@ -1157,6 +1168,14 @@ void handle_events(ns::Events& events)
                     img_info.pos_x += 1;
                     img_info.has_been_adjusted = true;
                     g_image_current_border_color = COLOR_GREY;
+                    break;
+                }
+                case 'h':
+                {
+                    auto& img_info = get_img_info_from_id(g_image_current_id);
+                    img_info.ignore = !img_info.ignore;
+                    img_info.has_been_adjusted = true;
+                    printf("Set image ignore to %d\n", (int)img_info.ignore);
                     break;
                 }
                 case 'n':
